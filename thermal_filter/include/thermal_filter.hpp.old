@@ -1,0 +1,57 @@
+#include <ros/ros.h>
+#include <ros/package.h>
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/PointCloud.h>
+#include <cv_bridge/cv_bridge.h>
+#include <iostream>
+#include <nodelet/nodelet.h>
+#include <image_geometry/pinhole_camera_model.h>
+
+namespace thermal_filter
+{
+std_msgs::Header rgb_image_header;
+
+cv_bridge::CvImageConstPtr cv_ptr_color = nullptr;
+cv_bridge::CvImageConstPtr cv_ptr_depth = nullptr;
+
+std::vector<DetectionObject> objects;
+
+ros::Publisher m_pub_pcl;
+ros::Publisher m_pub_det;
+
+sensor_msgs::PointCloud positions;
+
+class ThermalFilter : public nodelet::Nodelet
+{
+
+private:
+    const std::string m_node_name;
+    float focalLength;
+    float realObjectWidth;
+    float minDepth;
+    float maxDepth;
+    image_geometry::PinholeCameraModel dm_camera_model;
+    image_geometry::PinholeCameraModel rgb_camera_model;
+    sensor_msgs::Image dbg_msg;
+    cv_bridge::CvImage img_bridge;
+
+public:
+    ThermalFilter() : m_node_name("Thermal_Filter"){};
+    virtual void onInit();
+
+private:
+    void main_loop([[maybe_unused]] const ros::TimerEvent &evt);
+    sensor_msgs::PointCloud process(const cv::Mat &color, const cv::Mat &depth);
+    float getDepth(const cv::Mat &img, int xmin, int xmax, int ymin, int ymax);
+
+    double getDistfromRGB(const cv::Mat &color, const cv::Mat &debug_image, float &x, float &y, float xmin, float xmax, float ymin, float ymax);
+    double getDistfromRGB(float &x, float &y, float xmin, float xmax);
+
+    ros::Timer m_main_loop_timer;
+
+    ros::Subscriber image_color_subscriber;
+    ros::Subscriber image_depth_subscriber;
+    ros::Publisher dbg_pub;
+};
+
+} // namespace thermal_filter

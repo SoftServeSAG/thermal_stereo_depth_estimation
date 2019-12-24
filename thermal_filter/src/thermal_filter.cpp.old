@@ -1,0 +1,844 @@
+#include <TensorflowModel.h>
+#include "thermal_filter.hpp"
+#include <eigen3/Eigen/Eigen>
+namespace thermal_filter {
+
+    void imageColorCallback(const sensor_msgs::ImageConstPtr &msg) {
+        rgb_image_header = msg->header;
+        cv_ptr_color = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+    }
+
+    void imageDepthCallback(const sensor_msgs::ImageConstPtr &msg) {
+        cv_ptr_depth = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::TYPE_16UC1);
+
+    }
+
+    double BallDetection::getDistfromRGB(const cv::Mat &color, const cv::Mat &debug_image, float &x, float &y, float xmin, float xmax, float ymin, float ymax)
+    {
+        cv::Mat croppedImage;
+        double est_dist;
+        std::vector<std::vector<cv::Point> > contours; // Vector for storing contours
+
+        float xmin_init = xmin, xmax_init = xmax, ymin_init = ymin, ymax_init = ymax;
+
+        float padding = 20.0f;
+        xmin = std::max(0.0f, xmin - padding);
+        xmax = std::min(1.0f*color.size().width, xmax + padding);
+        ymin = std::max(0.0f, ymin - padding);
+        ymax = std::min(1.0f*color.size().height, ymax + padding);
+
+        cv::Mat color_clone = color.clone();
+
+        //crop the image within bounding box
+        try
+        {
+            cv::Rect ballROI(static_cast<int>(xmin), static_cast<int>(ymin),static_cast<int>(xmax) - static_cast<int>(xmin), static_cast<int>(ymax) - static_cast<int>(ymin));
+            croppedImage = color_clone(ballROI);
+        }        
+        catch(cv::Exception &e)
+        {
+            ROS_WARN("Could not crop bounding box from the image. Error: ", e.msg);
+            return maxDepth;
+        }
+
+        double dist_to_closest_contour = DBL_MAX;
+        double area_of_closest_contour = 0;
+        int total_area = 0;
+        bool cont_flag = false;
+        cv::Mat thr;
+        //cv::cvtColor( croppedImage, thr, cv::COLOR_RGB2GRAY ); //Convert to gray
+        cv::cvtColor( croppedImage, thr, cv::COLOR_BGR2GRAY ); //Convert to gray
+
+        int morph_size = 2;
+        cv::Mat element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size( 2*morph_size + 1, 2*morph_size+1 ), cv::Point( morph_size, morph_size ) );
+
+        cv::morphologyEx( thr, thr, cv::MORPH_OPEN, element);
+        cv::morphologyEx( thr, thr, cv::MORPH_CLOSE, element);
+        cv::GaussianBlur(thr, thr, cv::Size(5,5), 1.8);
+
+        cv::Mat cannyImage;
+        cv::Canny(thr, cannyImage,35, 93);
+        cv::findContours( cannyImage, contours, cv::RETR_TREE, cv::CHAIN_APPROX_NONE ); // Find the contours in the image
+//        cv::findContours( thr, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE ); // Find the contours in the image
+
+        for( size_t i = 0; i< contours.size(); i++ ) // iterate through each contour.
+        {
+            double area = cv::contourArea( contours[i] );  //  Find the area of contour
+            total_area += area;
+
+            double poly_dist = cv::pointPolygonTest(contours[i], cv::Point2f(x - xmin, y - ymin), true);
+            if (poly_dist > 0)
+            {
+                if(poly_dist < (xmax - xmin)/10.0)
+                {
+                    continue;
+                }
+                cont_flag = true;
+                if (poly_dist < dist_to_closest_contour)
+                {
+                    area_of_closest_contour = area;
+                    dist_to_closest_contour = poly_dist;
+                }
+            }
+            else if(poly_dist == 0)
+            {
+                ROS_ERROR("Center of the Ball/Baloon is on the contour. This should not ever happen!");
+            }
+
+            cv::drawContours( debug_image, contours, i, cv::Scalar( 255, 255, 255 ), 2, 8, cv::noArray(), INT_MAX, cv::Point(static_cast<int>(xmin), static_cast<int>(ymin)) ); // Draw the contour
+        }
+
+        double xa, xb;
+        double xf = 0.0f; // the variable is for mathematical correctnes, as it is the x coordinate of the image plane origin
+
+        if (!cont_flag)
+        {
+              xa = project(xmax_init, ymax_init, rgb_camera_model)[0];
+              xb = project(xmin_init, ymin_init, rgb_camera_model)[0];
+        }
+        else
+        {
+            double radius = sqrt(area_of_closest_contour/M_PI);
+            xa = (x + radius - rgb_camera_model.cx() - rgb_camera_model.Tx()) / rgb_camera_model.fx();
+            xb = (x - radius - rgb_camera_model.cx() -  rgb_camera_model.Tx()) / rgb_camera_model.fx();
+        }
+
+
+        double two_alpha_plus_beta = atan(xa - xf);
+        double beta = atan(xb - xf);
+        double alpha = 0.5f * (two_alpha_plus_beta - beta);
+
+        est_dist = (realObjectWidth / 2.0f) * (1.0f / (sin(alpha)) - 1.0f);
+
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+
+    }
+
+    double BallDetection::getDistfromRGB(float &x, float &y, float xmin, float xmax)
+    {
+        double est_dist;
+
+        float objectWidth = (xmax - xmin)/2.0f;
+
+        const Eigen::Vector3d l_vec = project(x - objectWidth*cos(M_PI_4), y - objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const Eigen::Vector3d r_vec = project(x + objectWidth*cos(M_PI_4), y + objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const double alpha = acos(l_vec.dot(r_vec)) / 2.0;
+
+        est_dist = (realObjectWidth/2) * sin(M_PI_2 - alpha) * (tan(alpha) + 1/tan(alpha));
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+    }
+
+    sensor_msgs::PointCloud BallDetection::process(const cv::Mat &color, const cv::Mat &depth) {
+        sensor_msgs::PointCloud res;
+        //res.header.frame_id = "color_realsense_uav1";
+        //res.header.stamp = ros::Time::now();
+        res.header = rgb_image_header;
+        objects = neuralNetwork->process(color);
+
+        double est_dist;
+
+        cv::Mat degub_image = color.clone();
+
+        for (auto &object : objects) {
+            if (object.confidence < 0.5) {
+                continue;
+            }
+            float x = static_cast<float>(object.xmin) + (static_cast<float>(object.xmax) - static_cast<float>(object.xmin)) / 2.0f;
+            float y = static_cast<float>(object.ymin) + (static_cast<float>(object.ymax) - static_cast<float>(object.ymin)) / 2.0f;
+            float depthReal =
+                    static_cast<float>(depth.at<unsigned short>(static_cast<int>(y), static_cast<int>(x))) / 1000.0f;
+
+            const float objectWidth = (static_cast<float>(object.xmax) - static_cast<float>(object.xmin))/2.0f;
+
+
+
+            double est_dist1 = getDistfromRGB(x, y, object.xmin, object.xmax);
+            double est_dist2 = getDistfromRGB(color, degub_image, x, y,
+                                              object.xmin, object.xmax,
+                                              object.ymin, object.ymax);
+
+            res.points.emplace_back();
+            res.points[res.points.size() - 1].x = (x - rgb_camera_model.cx() - rgb_camera_model.Tx())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fx();
+            res.points[res.points.size() - 1].y =  (y - rgb_camera_model.cy() - rgb_camera_model.Ty())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fy();
+            res.points[res.points.size() - 1].z = ((depthReal < 0.0001f) ? est_dist : depthReal);
+
+
+            float confidence = object.confidence;
+            if (confidence > 0) {
+                std::ostringstream conf;
+                conf << ":" << std::fixed << std::setprecision(3) << // confidence << " (" <<
+
+                     std::setprecision(3) << "R=" <<  depthReal <<
+                     std::setprecision(3) <<  ", C1=" << est_dist1 <<
+                     std::setprecision(3) <<  ", C2=" << est_dist2 << ")";
+
+                cv::putText(degub_image,
+                            "Ball" + conf.str(),
+                            cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin - 5)),
+                            cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
+                            cv::Scalar(0, 0, 255));
+                cv::rectangle(degub_image, cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin)),
+                              cv::Point2f(static_cast<float>(object.xmax), static_cast<float>(object.ymax)),
+                              (depthReal < 0.0001f) ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0), 5);
+                cv::circle(degub_image, cv::Point2f(static_cast<int>(x), static_cast<int>(y)), 5, cv::Scalar(255, 0, 255));
+
+            }
+        }
+
+        std_msgs::Header header_;
+        //header_.stamp = ros::Time::now();
+        header_ = rgb_image_header;
+        img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::BGR8,degub_image);
+        img_bridge.toImageMsg(dbg_msg);
+
+        dbg_pub.publish(dbg_msg);
+//        cv::imshow("Detection result", color);#include <TensorflowModel.h>
+#include "thermal_filter.hpp"
+#include <eigen3/Eigen/Eigen>
+namespace thermal_filter {
+
+    void imageColorCallback(const sensor_msgs::ImageConstPtr &msg) {
+        rgb_image_header = msg->header;
+        cv_ptr_color = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+    }
+
+    void imageDepthCallback(const sensor_msgs::ImageConstPtr &msg) {
+        cv_ptr_depth = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::TYPE_16UC1);
+
+    }
+
+    double BallDetection::getDistfromRGB(const cv::Mat &color, const cv::Mat &debug_image, float &x, float &y, float xmin, float xmax, float ymin, float ymax)
+    {
+        cv::Mat croppedImage;
+        double est_dist;
+        std::vector<std::vector<cv::Point> > contours; // Vector for storing contours
+
+        float xmin_init = xmin, xmax_init = xmax, ymin_init = ymin, ymax_init = ymax;
+
+        float padding = 20.0f;
+        xmin = std::max(0.0f, xmin - padding);
+        xmax = std::min(1.0f*color.size().width, xmax + padding);
+        ymin = std::max(0.0f, ymin - padding);
+        ymax = std::min(1.0f*color.size().height, ymax + padding);
+
+        cv::Mat color_clone = color.clone();
+
+        //crop the image within bounding box
+        try
+        {
+            cv::Rect ballROI(static_cast<int>(xmin), static_cast<int>(ymin),static_cast<int>(xmax) - static_cast<int>(xmin), static_cast<int>(ymax) - static_cast<int>(ymin));
+            croppedImage = color_clone(ballROI);
+        }        
+        catch(cv::Exception &e)
+        {
+            ROS_WARN("Could not crop bounding box from the image. Error: ", e.msg);
+            return maxDepth;
+        }
+
+        double dist_to_closest_contour = DBL_MAX;
+        double area_of_closest_contour = 0;
+        int total_area = 0;
+        bool cont_flag = false;
+        cv::Mat thr;
+        //cv::cvtColor( croppedImage, thr, cv::COLOR_RGB2GRAY ); //Convert to gray
+        cv::cvtColor( croppedImage, thr, cv::COLOR_BGR2GRAY ); //Convert to gray
+
+        int morph_size = 2;
+        cv::Mat element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size( 2*morph_size + 1, 2*morph_size+1 ), cv::Point( morph_size, morph_size ) );
+
+        cv::morphologyEx( thr, thr, cv::MORPH_OPEN, element);
+        cv::morphologyEx( thr, thr, cv::MORPH_CLOSE, element);
+        cv::GaussianBlur(thr, thr, cv::Size(5,5), 1.8);
+
+        cv::Mat cannyImage;
+        cv::Canny(thr, cannyImage,35, 93);
+        cv::findContours( cannyImage, contours, cv::RETR_TREE, cv::CHAIN_APPROX_NONE ); // Find the contours in the image
+//        cv::findContours( thr, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE ); // Find the contours in the image
+
+        for( size_t i = 0; i< contours.size(); i++ ) // iterate through each contour.
+        {
+            double area = cv::contourArea( contours[i] );  //  Find the area of contour
+            total_area += area;
+
+            double poly_dist = cv::pointPolygonTest(contours[i], cv::Point2f(x - xmin, y - ymin), true);
+            if (poly_dist > 0)
+            {
+                if(poly_dist < (xmax - xmin)/10.0)
+                {
+                    continue;
+                }
+                cont_flag = true;
+                if (poly_dist < dist_to_closest_contour)
+                {
+                    area_of_closest_contour = area;
+                    dist_to_closest_contour = poly_dist;
+                }
+            }
+            else if(poly_dist == 0)
+            {
+                ROS_ERROR("Center of the Ball/Baloon is on the contour. This should not ever happen!");
+            }
+
+            cv::drawContours( debug_image, contours, i, cv::Scalar( 255, 255, 255 ), 2, 8, cv::noArray(), INT_MAX, cv::Point(static_cast<int>(xmin), static_cast<int>(ymin)) ); // Draw the contour
+        }
+
+        double xa, xb;
+        double xf = 0.0f; // the variable is for mathematical correctnes, as it is the x coordinate of the image plane origin
+
+        if (!cont_flag)
+        {
+              xa = project(xmax_init, ymax_init, rgb_camera_model)[0];
+              xb = project(xmin_init, ymin_init, rgb_camera_model)[0];
+        }
+        else
+        {
+            double radius = sqrt(area_of_closest_contour/M_PI);
+            xa = (x + radius - rgb_camera_model.cx() - rgb_camera_model.Tx()) / rgb_camera_model.fx();
+            xb = (x - radius - rgb_camera_model.cx() -  rgb_camera_model.Tx()) / rgb_camera_model.fx();
+        }
+
+
+        double two_alpha_plus_beta = atan(xa - xf);
+        double beta = atan(xb - xf);
+        double alpha = 0.5f * (two_alpha_plus_beta - beta);
+
+        est_dist = (realObjectWidth / 2.0f) * (1.0f / (sin(alpha)) - 1.0f);
+
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+
+    }
+
+    double BallDetection::getDistfromRGB(float &x, float &y, float xmin, float xmax)
+    {
+        double est_dist;
+
+        float objectWidth = (xmax - xmin)/2.0f;
+
+        const Eigen::Vector3d l_vec = project(x - objectWidth*cos(M_PI_4), y - objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const Eigen::Vector3d r_vec = project(x + objectWidth*cos(M_PI_4), y + objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const double alpha = acos(l_vec.dot(r_vec)) / 2.0;
+
+        est_dist = (realObjectWidth/2) * sin(M_PI_2 - alpha) * (tan(alpha) + 1/tan(alpha));
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+    }
+
+    sensor_msgs::PointCloud BallDetection::process(const cv::Mat &color, const cv::Mat &depth) {
+        sensor_msgs::PointCloud res;
+        //res.header.frame_id = "color_realsense_uav1";
+        //res.header.stamp = ros::Time::now();
+        res.header = rgb_image_header;
+        objects = neuralNetwork->process(color);
+
+        double est_dist;
+
+        cv::Mat degub_image = color.clone();
+
+        for (auto &object : objects) {
+            if (object.confidence < 0.5) {
+                continue;
+            }
+            float x = static_cast<float>(object.xmin) + (static_cast<float>(object.xmax) - static_cast<float>(object.xmin)) / 2.0f;
+            float y = static_cast<float>(object.ymin) + (static_cast<float>(object.ymax) - static_cast<float>(object.ymin)) / 2.0f;
+            float depthReal =
+                    static_cast<float>(depth.at<unsigned short>(static_cast<int>(y), static_cast<int>(x))) / 1000.0f;
+
+            const float objectWidth = (static_cast<float>(object.xmax) - static_cast<float>(object.xmin))/2.0f;
+
+
+
+            double est_dist1 = getDistfromRGB(x, y, object.xmin, object.xmax);
+            double est_dist2 = getDistfromRGB(color, degub_image, x, y,
+                                              object.xmin, object.xmax,
+                                              object.ymin, object.ymax);
+
+            res.points.emplace_back();
+            res.points[res.points.size() - 1].x = (x - rgb_camera_model.cx() - rgb_camera_model.Tx())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fx();
+            res.points[res.points.size() - 1].y =  (y - rgb_camera_model.cy() - rgb_camera_model.Ty())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fy();
+            res.points[res.points.size() - 1].z = ((depthReal < 0.0001f) ? est_dist : depthReal);
+
+
+            float confidence = object.confidence;
+            if (confidence > 0) {
+                std::ostringstream conf;
+                conf << ":" << std::fixed << std::setprecision(3) << // confidence << " (" <<
+
+                     std::setprecision(3) << "R=" <<  depthReal <<
+                     std::setprecision(3) <<  ", C1=" << est_dist1 <<
+                     std::setprecision(3) <<  ", C2=" << est_dist2 << ")";
+
+                cv::putText(degub_image,
+                            "Ball" + conf.str(),
+                            cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin - 5)),
+                            cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
+                            cv::Scalar(0, 0, 255));
+                cv::rectangle(degub_image, cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin)),
+                              cv::Point2f(static_cast<float>(object.xmax), static_cast<float>(object.ymax)),
+                              (depthReal < 0.0001f) ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0), 5);
+                cv::circle(degub_image, cv::Point2f(static_cast<int>(x), static_cast<int>(y)), 5, cv::Scalar(255, 0, 255));
+
+            }
+        }
+
+        std_msgs::Header header_;
+        //header_.stamp = ros::Time::now();
+        header_ = rgb_image_header;
+        img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::BGR8,degub_image);
+        img_bridge.toImageMsg(dbg_msg);
+
+        dbg_pub.publish(dbg_msg);
+//        cv::imshow("Detection result", color);
+        /* cv::imshow("Depth", adjMap); */
+//         cv::waitKey(5);
+
+        return res;
+    }
+
+
+    /* main_loop() method //{ */
+    void BallDetection::main_loop([[maybe_unused]] const ros::TimerEvent &evt) {
+        // Check if we got all required messages
+        if (cv_ptr_depth && cv_ptr_color) {
+            const ros::WallTime start_t = ros::WallTime::now();
+            positions = process(cv_ptr_color->image, cv_ptr_depth->image);
+            sensor_msgs::PointCloud pcl_msg;
+
+            m_pub_pcl.publish(positions);
+
+
+            /* Some primitive profiling info //{ */
+            ros::WallDuration dur = ros::WallTime::now() - start_t;
+            ros::Duration del = ros::Time::now() - rgb_image_header.stamp;
+            static double fps = 1.0 / dur.toSec();
+            if (dur.toSec() > 0.0)
+                fps = 0.1 * (1.0 / dur.toSec()) + 0.9 * fps;
+
+            ROS_INFO("processing FPS: %fHz", fps);
+            ROS_INFO("         delay: %fms", del.toSec() * 1000.0);
+            ROS_INFO("    processing: %fms", del.toSec() * dur.toSec() * 1000.0);
+
+            cv_ptr_color = nullptr;
+            cv_ptr_depth = nullptr;
+        } else {
+            //ROS_WARN("Don't recieved");
+        }
+
+
+    }
+
+    //} Ball_Detction::main_loop
+
+    void BallDetection::onInit() {#include <TensorflowModel.h>
+#include "thermal_filter.hpp"
+#include <eigen3/Eigen/Eigen>
+namespace thermal_filter {
+
+    void imageColorCallback(const sensor_msgs::ImageConstPtr &msg) {
+        rgb_image_header = msg->header;
+        cv_ptr_color = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+    }
+
+    void imageDepthCallback(const sensor_msgs::ImageConstPtr &msg) {
+        cv_ptr_depth = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::TYPE_16UC1);
+
+    }
+
+    double BallDetection::getDistfromRGB(const cv::Mat &color, const cv::Mat &debug_image, float &x, float &y, float xmin, float xmax, float ymin, float ymax)
+    {
+        cv::Mat croppedImage;
+        double est_dist;
+        std::vector<std::vector<cv::Point> > contours; // Vector for storing contours
+
+        float xmin_init = xmin, xmax_init = xmax, ymin_init = ymin, ymax_init = ymax;
+
+        float padding = 20.0f;
+        xmin = std::max(0.0f, xmin - padding);
+        xmax = std::min(1.0f*color.size().width, xmax + padding);
+        ymin = std::max(0.0f, ymin - padding);
+        ymax = std::min(1.0f*color.size().height, ymax + padding);
+
+        cv::Mat color_clone = color.clone();
+
+        //crop the image within bounding box
+        try
+        {
+            cv::Rect ballROI(static_cast<int>(xmin), static_cast<int>(ymin),static_cast<int>(xmax) - static_cast<int>(xmin), static_cast<int>(ymax) - static_cast<int>(ymin));
+            croppedImage = color_clone(ballROI);
+        }        
+        catch(cv::Exception &e)
+        {
+            ROS_WARN("Could not crop bounding box from the image. Error: ", e.msg);
+            return maxDepth;
+        }
+
+        double dist_to_closest_contour = DBL_MAX;
+        double area_of_closest_contour = 0;
+        int total_area = 0;
+        bool cont_flag = false;
+        cv::Mat thr;
+        //cv::cvtColor( croppedImage, thr, cv::COLOR_RGB2GRAY ); //Convert to gray
+        cv::cvtColor( croppedImage, thr, cv::COLOR_BGR2GRAY ); //Convert to gray
+
+        int morph_size = 2;
+        cv::Mat element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size( 2*morph_size + 1, 2*morph_size+1 ), cv::Point( morph_size, morph_size ) );
+
+        cv::morphologyEx( thr, thr, cv::MORPH_OPEN, element);
+        cv::morphologyEx( thr, thr, cv::MORPH_CLOSE, element);
+        cv::GaussianBlur(thr, thr, cv::Size(5,5), 1.8);
+
+        cv::Mat cannyImage;
+        cv::Canny(thr, cannyImage,35, 93);
+        cv::findContours( cannyImage, contours, cv::RETR_TREE, cv::CHAIN_APPROX_NONE ); // Find the contours in the image
+//        cv::findContours( thr, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE ); // Find the contours in the image
+
+        for( size_t i = 0; i< contours.size(); i++ ) // iterate through each contour.
+        {
+            double area = cv::contourArea( contours[i] );  //  Find the area of contour
+            total_area += area;
+
+            double poly_dist = cv::pointPolygonTest(contours[i], cv::Point2f(x - xmin, y - ymin), true);
+            if (poly_dist > 0)
+            {
+                if(poly_dist < (xmax - xmin)/10.0)
+                {
+                    continue;
+                }
+                cont_flag = true;
+                if (poly_dist < dist_to_closest_contour)
+                {
+                    area_of_closest_contour = area;
+                    dist_to_closest_contour = poly_dist;
+                }
+            }
+            else if(poly_dist == 0)
+            {
+                ROS_ERROR("Center of the Ball/Baloon is on the contour. This should not ever happen!");
+            }
+
+            cv::drawContours( debug_image, contours, i, cv::Scalar( 255, 255, 255 ), 2, 8, cv::noArray(), INT_MAX, cv::Point(static_cast<int>(xmin), static_cast<int>(ymin)) ); // Draw the contour
+        }
+
+        double xa, xb;
+        double xf = 0.0f; // the variable is for mathematical correctnes, as it is the x coordinate of the image plane origin
+
+        if (!cont_flag)
+        {
+              xa = project(xmax_init, ymax_init, rgb_camera_model)[0];
+              xb = project(xmin_init, ymin_init, rgb_camera_model)[0];
+        }
+        else
+        {
+            double radius = sqrt(area_of_closest_contour/M_PI);
+            xa = (x + radius - rgb_camera_model.cx() - rgb_camera_model.Tx()) / rgb_camera_model.fx();
+            xb = (x - radius - rgb_camera_model.cx() -  rgb_camera_model.Tx()) / rgb_camera_model.fx();
+        }
+
+
+        double two_alpha_plus_beta = atan(xa - xf);
+        double beta = atan(xb - xf);
+        double alpha = 0.5f * (two_alpha_plus_beta - beta);
+
+        est_dist = (realObjectWidth / 2.0f) * (1.0f / (sin(alpha)) - 1.0f);
+
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+
+    }
+
+    double BallDetection::getDistfromRGB(float &x, float &y, float xmin, float xmax)
+    {
+        double est_dist;
+
+        float objectWidth = (xmax - xmin)/2.0f;
+
+        const Eigen::Vector3d l_vec = project(x - objectWidth*cos(M_PI_4), y - objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const Eigen::Vector3d r_vec = project(x + objectWidth*cos(M_PI_4), y + objectWidth*sin(M_PI_4), rgb_camera_model).normalized();
+        const double alpha = acos(l_vec.dot(r_vec)) / 2.0;
+
+        est_dist = (realObjectWidth/2) * sin(M_PI_2 - alpha) * (tan(alpha) + 1/tan(alpha));
+        if (isnan(est_dist) || est_dist < 0.0 || est_dist > maxDepth)
+        {
+             est_dist = est_dist < 0.0 ? 0.0 : maxDepth;
+        }
+
+        return est_dist;
+    }
+
+    sensor_msgs::PointCloud BallDetection::process(const cv::Mat &color, const cv::Mat &depth) {
+        sensor_msgs::PointCloud res;
+        //res.header.frame_id = "color_realsense_uav1";
+        //res.header.stamp = ros::Time::now();
+        res.header = rgb_image_header;
+        objects = neuralNetwork->process(color);
+
+        double est_dist;
+
+        cv::Mat degub_image = color.clone();
+
+        for (auto &object : objects) {
+            if (object.confidence < 0.5) {
+                continue;
+            }
+            float x = static_cast<float>(object.xmin) + (static_cast<float>(object.xmax) - static_cast<float>(object.xmin)) / 2.0f;
+            float y = static_cast<float>(object.ymin) + (static_cast<float>(object.ymax) - static_cast<float>(object.ymin)) / 2.0f;
+            float depthReal =
+                    static_cast<float>(depth.at<unsigned short>(static_cast<int>(y), static_cast<int>(x))) / 1000.0f;
+
+            const float objectWidth = (static_cast<float>(object.xmax) - static_cast<float>(object.xmin))/2.0f;
+
+
+
+            double est_dist1 = getDistfromRGB(x, y, object.xmin, object.xmax);
+            double est_dist2 = getDistfromRGB(color, degub_image, x, y,
+                                              object.xmin, object.xmax,
+                                              object.ymin, object.ymax);
+
+            res.points.emplace_back();
+            res.points[res.points.size() - 1].x = (x - rgb_camera_model.cx() - rgb_camera_model.Tx())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fx();
+            res.points[res.points.size() - 1].y =  (y - rgb_camera_model.cy() - rgb_camera_model.Ty())*((depthReal < 0.0001f) ? est_dist : depthReal) / rgb_camera_model.fy();
+            res.points[res.points.size() - 1].z = ((depthReal < 0.0001f) ? est_dist : depthReal);
+
+
+            float confidence = object.confidence;
+            if (confidence > 0) {
+                std::ostringstream conf;
+                conf << ":" << std::fixed << std::setprecision(3) << // confidence << " (" <<
+
+                     std::setprecision(3) << "R=" <<  depthReal <<
+                     std::setprecision(3) <<  ", C1=" << est_dist1 <<
+                     std::setprecision(3) <<  ", C2=" << est_dist2 << ")";
+
+                cv::putText(degub_image,
+                            "Ball" + conf.str(),
+                            cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin - 5)),
+                            cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
+                            cv::Scalar(0, 0, 255));
+                cv::rectangle(degub_image, cv::Point2f(static_cast<float>(object.xmin), static_cast<float>(object.ymin)),
+                              cv::Point2f(static_cast<float>(object.xmax), static_cast<float>(object.ymax)),
+                              (depthReal < 0.0001f) ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0), 5);
+                cv::circle(degub_image, cv::Point2f(static_cast<int>(x), static_cast<int>(y)), 5, cv::Scalar(255, 0, 255));
+
+            }
+        }
+
+        std_msgs::Header header_;
+        //header_.stamp = ros::Time::now();
+        header_ = rgb_image_header;
+        img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::BGR8,degub_image);
+        img_bridge.toImageMsg(dbg_msg);
+
+        dbg_pub.publish(dbg_msg);
+//        cv::imshow("Detection result", color);
+        /* cv::imshow("Depth", adjMap); */
+//         cv::waitKey(5);
+
+        return res;
+    }
+
+
+    /* main_loop() method //{ */
+    void BallDetection::main_loop([[maybe_unused]] const ros::TimerEvent &evt) {
+        // Check if we got all required messages
+        if (cv_ptr_depth && cv_ptr_color) {
+            const ros::WallTime start_t = ros::WallTime::now();
+            positions = process(cv_ptr_color->image, cv_ptr_depth->image);
+            sensor_msgs::PointCloud pcl_msg;
+
+            m_pub_pcl.publish(positions);
+
+
+            /* Some primitive profiling info //{ */
+            ros::WallDuration dur = ros::WallTime::now() - start_t;
+            ros::Duration del = ros::Time::now() - rgb_image_header.stamp;
+            static double fps = 1.0 / dur.toSec();
+            if (dur.toSec() > 0.0)
+                fps = 0.1 * (1.0 / dur.toSec()) + 0.9 * fps;
+
+            ROS_INFO("processing FPS: %fHz", fps);
+            ROS_INFO("         delay: %fms", del.toSec() * 1000.0);
+            ROS_INFO("    processing: %fms", del.toSec() * dur.toSec() * 1000.0);
+
+            cv_ptr_color = nullptr;
+            cv_ptr_depth = nullptr;
+        } else {
+            //ROS_WARN("Don't recieved");
+        }
+
+
+    }
+
+    //} Ball_Detction::main_loop
+
+    void BallDetection::onInit() {
+        ros::NodeHandle nh_ = nodelet::Nodelet::getPrivateNodeHandle();
+        ros::Time::waitForValid();
+
+        int im_width;
+        int im_height;
+        float threshold_1;
+        int loop_rate;
+
+        nh_.getParam("focal_length", focalLength);
+        nh_.getParam("real_object_width", realObjectWidth);
+
+        nh_.getParam("min_depth", minDepth);
+        nh_.getParam("max_depth", maxDepth);
+
+        nh_.getParam("im_width", im_width);
+        nh_.getParam("im_height", im_height);
+        nh_.getParam("detection_threshold", threshold_1);
+        nh_.getParam("loop_rate", loop_rate);
+
+        image_color_subscriber = nh_.subscribe("rgb_image", 10, &imageColorCallback);
+        image_depth_subscriber = nh_.subscribe("dm_image", 10, &imageDepthCallback);
+
+        dbg_pub = nh_.advertise<sensor_msgs::Image>("debug_image", 10);
+        m_pub_pcl = nh_.advertise<sensor_msgs::PointCloud>("detected_objects_pcl", 10);
+
+        ROS_INFO("[%s]: Node Initialized", m_node_name.c_str());
+        dm_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("rgb_camera_info")));
+        ROS_INFO("[%s]: Got RGB camera info", m_node_name.c_str());
+        rgb_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("dm_camera_info")));
+        ROS_INFO("[%s]: Got depthmap camera info", m_node_name.c_str());
+
+        m_main_loop_timer = nh_.createTimer(ros::Rate(loop_rate), &BallDetection::main_loop, this);
+    }
+
+}
+
+#include <pluginlib/class_list_macros.h>
+
+PLUGINLIB_EXPORT_CLASS(thermal_filter::BallDetection, nodelet::Nodelet)
+
+        ros::NodeHandle nh_ = nodelet::Nodelet::getPrivateNodeHandle();
+        ros::Time::waitForValid();
+
+        int im_width;
+        int im_height;
+        float threshold_1;
+        int loop_rate;
+
+        nh_.getParam("focal_length", focalLength);
+        nh_.getParam("real_object_width", realObjectWidth);
+
+        nh_.getParam("min_depth", minDepth);
+        nh_.getParam("max_depth", maxDepth);
+
+        nh_.getParam("im_width", im_width);
+        nh_.getParam("im_height", im_height);
+        nh_.getParam("detection_threshold", threshold_1);
+        nh_.getParam("loop_rate", loop_rate);
+
+        image_color_subscriber = nh_.subscribe("rgb_image", 10, &imageColorCallback);
+        image_depth_subscriber = nh_.subscribe("dm_image", 10, &imageDepthCallback);
+
+        dbg_pub = nh_.advertise<sensor_msgs::Image>("debug_image", 10);
+        m_pub_pcl = nh_.advertise<sensor_msgs::PointCloud>("detected_objects_pcl", 10);
+
+        ROS_INFO("[%s]: Node Initialized", m_node_name.c_str());
+        dm_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("rgb_camera_info")));
+        ROS_INFO("[%s]: Got RGB camera info", m_node_name.c_str());
+        rgb_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("dm_camera_info")));
+        ROS_INFO("[%s]: Got depthmap camera info", m_node_name.c_str());
+
+        m_main_loop_timer = nh_.createTimer(ros::Rate(loop_rate), &BallDetection::main_loop, this);
+    }
+
+}
+
+#include <pluginlib/class_list_macros.h>
+
+PLUGINLIB_EXPORT_CLASS(thermal_filter::BallDetection, nodelet::Nodelet)
+
+            const ros::WallTime start_t = ros::WallTime::now();
+            positions = process(cv_ptr_color->image, cv_ptr_depth->image);
+            sensor_msgs::PointCloud pcl_msg;
+
+            m_pub_pcl.publish(positions);
+
+
+            /* Some primitive profiling info //{ */
+            ros::WallDuration dur = ros::WallTime::now() - start_t;
+            ros::Duration del = ros::Time::now() - rgb_image_header.stamp;
+            static double fps = 1.0 / dur.toSec();
+            if (dur.toSec() > 0.0)
+                fps = 0.1 * (1.0 / dur.toSec()) + 0.9 * fps;
+
+            ROS_INFO("processing FPS: %fHz", fps);
+            ROS_INFO("         delay: %fms", del.toSec() * 1000.0);
+            ROS_INFO("    processing: %fms", del.toSec() * dur.toSec() * 1000.0);
+
+            cv_ptr_color = nullptr;
+            cv_ptr_depth = nullptr;
+        } else {
+            //ROS_WARN("Don't recieved");
+        }
+
+
+    }
+
+    //} Ball_Detction::main_loop
+
+    void BallDetection::onInit() {
+        ros::NodeHandle nh_ = nodelet::Nodelet::getPrivateNodeHandle();
+        ros::Time::waitForValid();
+
+        int im_width;
+        int im_height;
+        float threshold_1;
+        int loop_rate;
+
+        nh_.getParam("focal_length", focalLength);
+        nh_.getParam("real_object_width", realObjectWidth);
+
+        nh_.getParam("min_depth", minDepth);
+        nh_.getParam("max_depth", maxDepth);
+
+        nh_.getParam("im_width", im_width);
+        nh_.getParam("im_height", im_height);
+        nh_.getParam("detection_threshold", threshold_1);
+        nh_.getParam("loop_rate", loop_rate);
+
+        image_color_subscriber = nh_.subscribe("rgb_image", 10, &imageColorCallback);
+        image_depth_subscriber = nh_.subscribe("dm_image", 10, &imageDepthCallback);
+
+        dbg_pub = nh_.advertise<sensor_msgs::Image>("debug_image", 10);
+        m_pub_pcl = nh_.advertise<sensor_msgs::PointCloud>("detected_objects_pcl", 10);
+
+        ROS_INFO("[%s]: Node Initialized", m_node_name.c_str());
+        dm_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("rgb_camera_info")));
+        ROS_INFO("[%s]: Got RGB camera info", m_node_name.c_str());
+        rgb_camera_model.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("dm_camera_info")));
+        ROS_INFO("[%s]: Got depthmap camera info", m_node_name.c_str());
+
+        m_main_loop_timer = nh_.createTimer(ros::Rate(loop_rate), &BallDetection::main_loop, this);
+    }
+
+}
+
+#include <pluginlib/class_list_macros.h>
+
+PLUGINLIB_EXPORT_CLASS(thermal_filter::BallDetection, nodelet::Nodelet)
