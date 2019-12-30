@@ -38,22 +38,8 @@ _Float32 Temperature_matrix[32][32];
 _Float32 Arr_2[1024];
 _Float32 Temperature_matrix_2[32][32];
 
-void arrayCallback(const std_msgs::Float64MultiArray::ConstPtr &array);
-void arrayCallback_2(const std_msgs::Float64MultiArray::ConstPtr &array);
 double center_1;
 double center_2;
-
-// double printCalibrationParameter() {
-//   double d = 0;
-
-//   if(center_1==0 || center_2 ==0) {
-//     return 0;
-//   } else {
-//     d=abs(center_1-center_2);
-//   }
-
-//   return (2 * d)/B;
-// }
 
 double getDistance() {
 
@@ -66,7 +52,7 @@ double getDistance() {
   return (F*B)/d;
 }
 
-std::vector<double> getMassCenters(temperature_matrix){
+std::vector<double> getMassCenters(double temperature_matrix[]){
   // get matrix center
   double cx = 0;
   double cy = 0;
@@ -83,8 +69,8 @@ std::vector<double> getMassCenters(temperature_matrix){
   }
 
   //those are center's the cell coordinates within the matrix
-  int cmx = (cx / (m + 0.00001));
-  int cmy = (cy / (m + 0.00001));
+  double cmx = (cx / (m + 0.00001));
+  double cmy = (cy / (m + 0.00001));
 
   return std::vector<double> ({cmx,cmy});
 }
@@ -277,42 +263,6 @@ void imageCallbackFirstCamera(const sensor_msgs::ImageConstPtr &msg)
   }
 }
 
-void imageCallbackSecondCamera(const sensor_msgs::ImageConstPtr &msg)
-{
-  cv::Mat img_out;
-  sensor_msgs::Image dbg_msg;
-
-  try
-  {
-    //Get pointer to thermal image
-    cv_bridge::CvImageConstPtr thermal_image_pntr = cv_bridge::toCvShare(msg, "rgb8");
-
-    // Get image Mat
-    cv::Mat thermal_image = thermal_image_pntr->image;
-
-    // Clone image before processing
-    cv::Mat img_gray = thermal_image.clone();
-
-    // Denoise image
-    cv::fastNlMeansDenoising(img_gray, img_out, 10.0, 3, 6);
-
-    // Define headers
-    std_msgs::Header header_;
-    header_ = msg->header;
-
-    cv_bridge::CvImage img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::BGR8, img_out);
-    img_bridge.toImageMsg(dbg_msg);
-
-    //Publish to topic
-    dbg_pub_2.publish(dbg_msg);
-    cv::waitKey(2);
-  }
-  catch (cv_bridge::Exception &e)
-  {
-    ROS_ERROR(msg->encoding.c_str());
-  }
-}
-
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "image_listener");
@@ -320,7 +270,6 @@ int main(int argc, char **argv)
 
   image_transport::ImageTransport it(nh);
   image_transport::Subscriber sub = it.subscribe("/uav1/thermal/bottom/rgb_image", 1, &imageCallbackFirstCamera);
-  image_transport::Subscriber sub_2 = it.subscribe("/uav1/thermal/middle/rgb_image", 1, &imageCallbackSecondCamera);
 
   // Subscribers for temperature array
   ros::Subscriber sub_3 = nh.subscribe("/uav1/thermal/bottom/raw_temp_array", 10, arrayCallback);
