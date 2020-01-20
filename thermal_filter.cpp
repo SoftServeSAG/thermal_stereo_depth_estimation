@@ -10,12 +10,12 @@
 #include "std_msgs/MultiArrayDimension.h"
 #include "std_msgs/Float64MultiArray.h"
 #include <string>
+#include <stdlib.h>
 #include <math.h>
+#include <vector>
 
-ros::Publisher dbg_pub;
-ros::Publisher dbg_pub_2;
 ros::Publisher dbg_pub_true_temp;
-ros::Publisher dbg_pub_true_temp_2;
+ros::Publisher dbg_pub_true_temp_left;
 
 // --------- Parameters ------------
 
@@ -35,48 +35,209 @@ double d = 0;
 _Float32 Arr[1024];
 _Float32 Temperature_matrix[32][32];
 
+std::vector<std::vector<int>> Logical_matrix = std::vector(32, std::vector<int>(32, 0));
+std::vector<std::vector<int>> Cluster_matrix;
 _Float32 Arr_2[1024];
 _Float32 Temperature_matrix_2[32][32];
+__int16_t Logical_matrix_2[32][32];
 
-double center_1;
-double center_2;
+std::vector<std::vector<double>> centersVectorRight;
+std::vector<std::vector<double>> centersVectorLeft;
 
-double getDistance() {
-
-  if(center_1==0 || center_2 ==0) {
-    return 0;
-  } else {
-    d=abs(center_1-center_2);
-  }
-
-  return (F*B)/d;
-}
-
-std::vector<double> getMassCenters(double temperature_matrix[]){
-  // get matrix center
-  double cx = 0;
-  double cy = 0;
-  double m = 0;
-
-  for (int x = 0; x < 32; x++)
+bool checkCorrespondence(double centerYLeft, double centerYRight, double centerXLeft, double centerXRight, int &leftIterator, int &rightIterator)
+{
+  ROS_INFO("CenterXLeft: %f", centerXLeft);
+  if (abs(centerYLeft - centerYRight) > 2)
+    return false;
+  else if (centerXLeft < 3)
   {
-    for (int y = 0; y < 32; y++)
+    leftIterator++;
+    return false;
+  }
+  else if (centerXRight > 29)
+  {
+    rightIterator++;
+    return false;
+  }
+  else
+    return true;
+}
+std::vector<double> getDistance(std::vector<std::vector<double>> centersVectorRight, std::vector<std::vector<double>> centersVectorLeft)
+{
+  std::vector<double> distanceVector;
+  
+  
+
+  int size = std::min(centersVectorLeft.size(), centersVectorRight.size());
+  int leftIterator = 0;
+  int rightIterator = 0;
+
+  ROS_INFO("Distance function");
+  
+
+  while ((leftIterator < centersVectorLeft.size()) && (rightIterator < centersVectorRight.size()))
+  { 
+    ROS_INFO("Stucked");
+    
+    double centerYLeft = centersVectorLeft[leftIterator][0];
+    double centerYRight = centersVectorRight[rightIterator][0];
+
+    double centerXLeft = centersVectorLeft[leftIterator][1];
+    double centerXRight = centersVectorRight[rightIterator][1];
+
+    if (checkCorrespondence(centerYLeft, centerYRight, centerXLeft, centerXRight, leftIterator, rightIterator))
     {
-      cx += Temperature_matrix[x][y] * x;
-      cy += Temperature_matrix[x][y] * y;
-      m += Temperature_matrix[x][y];
+
+      ROS_INFO("CenterL: %f", centerXLeft);
+      ROS_INFO("CenterR: %f", centerXRight);
+
+      if (centerXLeft == 0 || centerXRight == 0)
+      {
+        distanceVector.push_back(0);
+      }
+      else
+      {
+        d = abs(centerXLeft - centerXRight);
+        distanceVector.push_back((F * B) / d);
+      }
+
+      
+
+      leftIterator++;
+      rightIterator++;
     }
   }
 
-  //those are center's the cell coordinates within the matrix
-  double cmx = (cx / (m + 0.00001));
-  double cmy = (cy / (m + 0.00001));
-
-  return std::vector<double> ({cmx,cmy});
+  return distanceVector;
 }
 
+std::vector<std::vector<int>> toLogicalArray(_Float32 temp_matrix[][32])
+{
+  std::vector<std::vector<int>> logical_vector = std::vector(32, std::vector<int>(32, 0));
+  for (int i = 0; i < 32; i++)
+  {
+    for (int j = 0; j < 32; j++)
+    {
+      logical_vector[i][j] = (temp_matrix[i][j] > 0 ? -1 : 0);
+    }
+  }
 
-void arrayCallback(const std_msgs::Float64MultiArray::ConstPtr &array)
+  return logical_vector;
+}
+
+// Xmax Ymax Xmin Ymin
+std::vector<std::vector<int>> toClusterArray(std::vector<std::vector<int>> logical_vector, std::vector<std::vector<int>> &coordinates_map)
+{
+  int clusternum = 1;
+  int Xmin;
+  int Xmax;
+  int Ymin;
+  int Ymax;
+
+  for (int i = 0; i < 32; i++)
+  {
+    for (int j = 0; j < 32; j++)
+    {
+      int pixel = logical_vector[i][j];
+
+      int left = 0;
+      int right = 0;
+      int up = 0;
+      int down = 0;
+
+      if (pixel == -1)
+      {
+        logical_vector[i][j] = clusternum;
+
+        left = (i - 1) < 0 ? 0 : logical_vector[i - 1][j];
+        right = (i + 1) > 31 ? 0 : logical_vector[i + 1][j];
+        down = (j + 1) > 31 ? 0 : logical_vector[i][j + 1];
+        up = (j - 1) < 0 ? 0 : logical_vector[i][j - 1];
+
+        int clusterfind = std::max({left, right, down, up});
+
+        // ROS_INFO("clusterfind %d", clusterfind);
+
+        if (clusterfind > 0)
+        {
+
+          logical_vector[i][j] = clusterfind;
+          Xmax = std::max(coordinates_map[clusterfind - 1][0], i);
+          Ymax = std::max(coordinates_map[clusterfind - 1][1], j);
+          Xmin = std::min(coordinates_map[clusterfind - 1][2], i);
+          Ymin = std::min(coordinates_map[clusterfind - 1][3], j);
+
+          coordinates_map[clusterfind - 1] = std::vector<int>{Xmax, Ymax, Xmin, Ymin};
+        }
+        else
+        {
+          logical_vector[i][j] = clusternum;
+          coordinates_map.push_back(std::vector<int>{i, j, i, j});
+          clusternum++;
+        }
+      }
+    }
+  }
+
+  return logical_vector;
+}
+
+bool compareCoordinates(std::vector<int> v1, std::vector<int> v2)
+{
+  if (v1[1] < v2[1])
+  {
+    return true;
+  }
+  else if (v1[1] == v2[1])
+  {
+    return (v1[0] <= v2[0]);
+  }
+  else
+    return false;
+}
+
+std::vector<std::vector<double>> getMassCenters(_Float32 temperature_matrix[32][32], std::vector<std::vector<int>> coordinates_vector)
+{
+
+  std::vector<std::vector<double>> output;
+
+  sort(coordinates_vector.begin(), coordinates_vector.end(), compareCoordinates);
+
+  for (int i = 0; i < coordinates_vector.size(); i++)
+  {
+    ROS_INFO("Xsmall: %d", coordinates_vector[i][1]);
+  }
+
+  for (int i = 0; i < coordinates_vector.size(); i++)
+  {
+    // get matrix center
+    double cx = 0;
+    double cy = 0;
+    double m = 0;
+    std::vector<int> current_matrix_vector = coordinates_vector[i];
+
+    for (int x = current_matrix_vector[2]; x <= current_matrix_vector[0]; x++)
+    {
+      for (int y = current_matrix_vector[3]; y <= current_matrix_vector[1]; y++)
+      {
+        cx += temperature_matrix[x][y] * x;
+        cy += temperature_matrix[x][y] * y;
+        m += temperature_matrix[x][y];
+      }
+    }
+
+    //those are center's the cell coordinates within the matrix
+    double cmx = (cx / (m + 0.000001));
+    double cmy = (cy / (m + 0.000001));
+
+    output.push_back(std::vector<double>{cmx, cmy});
+  }
+
+  return output;
+}
+
+//Callbacks
+void tempCallbackRight(const std_msgs::Float64MultiArray::ConstPtr &array)
 {
 
   int i = 0;
@@ -95,54 +256,27 @@ void arrayCallback(const std_msgs::Float64MultiArray::ConstPtr &array)
     i++;
   }
 
-  // Print it
-  // printf("\n");
-  // printf("%f", max_temp);
-  // printf("-----------------------------------------------------------------");
-
   for (int i = 0; i < 32; i++)
   {
     for (int j = 0; j < 32; j++)
     {
-      //printf("%d", Arr[32*i + j]);
       Temperature_matrix[i][j] = Arr[32 * i + j] < HEATMAP_RATIO * max_temp ? 0 : Arr[32 * i + j];
-      // printf("%f", Temperature_matrix[i][j]);
-      // printf(" ");
     }
-    // printf("\n");
   }
 
-  // printf("\n");
-  // printf("-----------------------------------------------------------------");
-  // printf("\n");
+  // init new coordnates array for further interaction
+  std::vector<std::vector<int>> coordinates_matrix;
 
-  // get matrix center
-  double cx = 0;
-  double cy = 0;
-  double m = 0;
+  Logical_matrix = toLogicalArray(Temperature_matrix);
+  Cluster_matrix = toClusterArray(Logical_matrix, coordinates_matrix);
 
-  for (int x = 0; x < 32; x++)
+  centersVectorRight = getMassCenters(Temperature_matrix, coordinates_matrix);
+
+  for (int i = 0; i < centersVectorRight.size(); i++)
   {
-    for (int y = 0; y < 32; y++)
-    {
-      cx += Temperature_matrix[x][y] * x;
-      cy += Temperature_matrix[x][y] * y;
-      m += Temperature_matrix[x][y];
-    }
+    //whatever you'd need that value for (the position is more likely what you're after)
+    double centerOfMassValue = Temperature_matrix[(int)centersVectorRight[i].at(0)][(int)centersVectorRight[i].at(1)] = 249;
   }
-
-  //those are center's the cell coordinates within the matrix
-  int cmx = (int)(cx / (m + 0.00001));
-  int cmy = (int)(cy / (m + 0.00001));
-
-  printf("\n");
-  printf("CMY1: ");
-  printf("%d",cmy);
-  printf("\n");
-  center_1 = (cy / (m + 0.00001));
-
-  //whatever you'd need that value for (the position is more likely what you're after)
-  double centerOfMassValue = Temperature_matrix[cmx][cmy] = 249;
 
   cv::Mat image = cv::Mat(32, 32, CV_32FC1, Temperature_matrix);
   std_msgs::Header header_;
@@ -155,8 +289,7 @@ void arrayCallback(const std_msgs::Float64MultiArray::ConstPtr &array)
   return;
 }
 
-
-void arrayCallback_2(const std_msgs::Float64MultiArray::ConstPtr &array)
+void tempCallbackLeft(const std_msgs::Float64MultiArray::ConstPtr &array)
 {
 
   int i = 0;
@@ -183,33 +316,19 @@ void arrayCallback_2(const std_msgs::Float64MultiArray::ConstPtr &array)
     }
   }
 
-  // get matrix center
-  double cx = 0;
-  double cy = 0;
-  double m = 0;
+  // init new coordnates array for further interaction
+  std::vector<std::vector<int>> coordinates_matrix;
 
-  for (int x = 0; x < 32; x++)
+  Logical_matrix = toLogicalArray(Temperature_matrix_2);
+  Cluster_matrix = toClusterArray(Logical_matrix, coordinates_matrix);
+
+  centersVectorLeft = getMassCenters(Temperature_matrix_2, coordinates_matrix);
+
+  for (int i = 0; i < centersVectorLeft.size(); i++)
   {
-    for (int y = 0; y < 32; y++)
-    {
-      cx += Temperature_matrix_2[x][y] * x;
-      cy += Temperature_matrix_2[x][y] * y;
-      m += Temperature_matrix_2[x][y];
-    }
+    //whatever you'd need that value for (the position is more likely what you're after)
+    double centerOfMassValue = Temperature_matrix_2[(int)centersVectorLeft[i].at(0)][(int)centersVectorLeft[i].at(1)] = 249;
   }
-
-  //those are center's the cell coordinates within the matrix
-  int cmx = (int)(cx / (m + 0.00001));
-  int cmy = (int)(cy / (m + 0.00001));
-
-  printf("\n");
-  printf("CMY2: ");
-  printf("%d",cmy);
-  printf("\n");
-  center_2 = (cy / (m + 0.00001));
-
-  //whatever you'd need that value for (the position is more likely what you're after)
-  double centerOfMassValue = Temperature_matrix_2[cmx][cmy] = 249;
 
   cv::Mat image = cv::Mat(32, 32, CV_32FC1, Temperature_matrix_2);
   std_msgs::Header header_;
@@ -218,49 +337,17 @@ void arrayCallback_2(const std_msgs::Float64MultiArray::ConstPtr &array)
   img_bridge.toImageMsg(dbg_msg);
 
   // Publish to topic
-  dbg_pub_true_temp_2.publish(dbg_msg);
+  dbg_pub_true_temp_left.publish(dbg_msg);
 
   printf("\n");
-  printf("%f",getDistance());
+  std::vector<double> distances = getDistance(centersVectorRight, centersVectorLeft);
+  for (int i = 0; i < distances.size(); i++)
+  {
+    ROS_INFO("Distance %d: %f", i, distances[i]);
+  }
+  
   printf("\n");
-  return;
-}
-
-
-void imageCallbackFirstCamera(const sensor_msgs::ImageConstPtr &msg)
-{
-  cv::Mat img_out;
-  sensor_msgs::Image dbg_msg;
-
-  try
-  {
-    //Get pointer to thermal image
-    cv_bridge::CvImageConstPtr thermal_image_pntr = cv_bridge::toCvShare(msg, "rgb8");
-
-    // Get image Mat
-    cv::Mat thermal_image = thermal_image_pntr->image;
-
-    // Clone image before processing
-    cv::Mat img_gray = thermal_image.clone();
-
-    // Denoise image
-    cv::fastNlMeansDenoising(img_gray, img_out, 10.0, 3, 6);
-
-    // Define headers
-    std_msgs::Header header_;
-    header_ = msg->header;
-
-    cv_bridge::CvImage img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::BGR8, img_out);
-    img_bridge.toImageMsg(dbg_msg);
-
-    //Publish to topic
-    dbg_pub.publish(dbg_msg);
-    cv::waitKey(2);
-  }
-  catch (cv_bridge::Exception &e)
-  {
-    ROS_ERROR(msg->encoding.c_str());
-  }
+  return; 
 }
 
 int main(int argc, char **argv)
@@ -269,19 +356,17 @@ int main(int argc, char **argv)
   ros::NodeHandle nh;
 
   image_transport::ImageTransport it(nh);
-  image_transport::Subscriber sub = it.subscribe("/uav1/thermal/bottom/rgb_image", 1, &imageCallbackFirstCamera);
 
   // Subscribers for temperature array
-  ros::Subscriber sub_3 = nh.subscribe("/uav1/thermal/bottom/raw_temp_array", 10, arrayCallback);
-  ros::Subscriber sub_4 = nh.subscribe("/uav1/thermal/middle/raw_temp_array", 10, arrayCallback_2);
 
-  // Publishers for noise-reduces images
-  dbg_pub = nh.advertise<sensor_msgs::Image>("debug_image", 10);
-  dbg_pub_2 = nh.advertise<sensor_msgs::Image>("debug_image_2", 10);
+  ros::Subscriber sub_left = nh.subscribe("/uav1/thermal/middle/raw_temp_array", 1, tempCallbackRight);   // Left camera
+  ros::Subscriber sub_right = nh.subscribe("/uav1/thermal/bottom/raw_temp_array", 1, tempCallbackLeft); // Right camera
 
   // Publishers for temperature arrays (to CV Image)
-  dbg_pub_true_temp = nh.advertise<sensor_msgs::Image>("debug_temp", 10);
-  dbg_pub_true_temp_2 = nh.advertise<sensor_msgs::Image>("debug_temp_2", 10);
+  dbg_pub_true_temp = nh.advertise<sensor_msgs::Image>("right_debug_temp", 10);
+  dbg_pub_true_temp_left = nh.advertise<sensor_msgs::Image>("left_debug_temp", 10);
+
+  ROS_INFO("START");
 
   ros::spin();
 }
