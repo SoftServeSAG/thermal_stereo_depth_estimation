@@ -1,48 +1,142 @@
-#include <ros/ros.h>
-#include <image_transport/image_transport.h>
-#include "opencv2/opencv.hpp"
-#include <opencv2/highgui/highgui.hpp>
-#include "opencv2/imgproc/imgproc.hpp"
-#include <cv_bridge/cv_bridge.h>
-#include <opencv2/core/core.hpp>
+#include "thermal_stereo.hpp"
 
-#include "std_msgs/MultiArrayLayout.h"
-#include "std_msgs/MultiArrayDimension.h"
-#include "std_msgs/Float64MultiArray.h"
-#include <string>
-#include <stdlib.h>
-#include <math.h>
-#include <vector>
+namespace thermal_stereo
+{
 
-ros::Publisher dbg_pub_true_temp;
-ros::Publisher dbg_pub_true_temp_left;
+void ThermalStereo::tempCallbackLeft(const std_msgs::Float64MultiArray::ConstPtr &msg)
+{
+  if (!is_initialized_)
+    return;
 
-// --------- Parameters ------------
+  /* update the checks-related variables (in a thread-safe manner) */
+  {
+    std::scoped_lock lock(mutex_left_thermal_counters_);
+    got_left_thermal_data_ = true;
+    time_last_left_thermal_data_ = ros::Time::now();
+    got_new_left_thermal_data_ = true;
+  }
 
-const double HEATMAP_RATIO = 0.80;
-const double START_TEMPERATURE = 50;
+  {
+    std::scoped_lock lock(mutex_left_thermal_data_);
+    left_thermal_layout_ = msg->layout;
+    //left_thermal_data_ = std::make_unique<std_msgs::Float64 []>(msg->data);
+    left_thermal_data_ = msg->data;
+  }
+  ROS_INFO("Left Message");
+}
 
-// Depth estimation parameters
-// Distance between cameras
-const double B = 0.20;
-// Focal parameter
-const double F = 55;
-// Init distance
-double d = 0;
+void ThermalStereo::tempCallbackRight(const std_msgs::Float64MultiArray::ConstPtr &msg)
+{
+  if (!is_initialized_)
+    return;
 
-// ---------------------------------
+  /* update the checks-related variables (in a thread-safe manner) */
+  {
+    std::scoped_lock lock(mutex_right_thermal_counters_);
+    got_right_thermal_data_ = true;
+    time_last_right_thermal_data_ = ros::Time::now();
+    got_new_right_thermal_data_ = true;
+  }
 
-_Float32 Arr[1024];
-_Float32 Temperature_matrix[32][32];
+  {
+    std::scoped_lock lock(mutex_right_thermal_data_);
+    right_thermal_layout_ = msg->layout;
+    //right_thermal_data_ = std::make_unique<std_msgs::Float64 []>(msg->data);
+    right_thermal_data_ = msg->data;
+  }
+  ROS_INFO("Right Message");
+}
 
-std::vector<std::vector<int>> Logical_matrix = std::vector(32, std::vector<int>(32, 0));
-std::vector<std::vector<int>> Cluster_matrix;
-_Float32 Arr_2[1024];
-_Float32 Temperature_matrix_2[32][32];
-__int16_t Logical_matrix_2[32][32];
+/* Dynamic reconfigure Callback */
+void ThermalStereo::callbackDynamicReconfigure([[maybe_unused]] Config &config, [[maybe_unused]] uint32_t level)
+{
 
-std::vector<std::vector<double>> centersVectorRight;
-std::vector<std::vector<double>> centersVectorLeft;
+  if (!is_initialized_)
+    return;
+
+  ROS_INFO(
+      "[BallDetection]:"
+      "Reconfigure Request: "
+      "Focal parameter: %2.2f",
+      config.focal_param);
+  {
+    std::scoped_lock lock(mutex_focal_param_);
+    _focal_param_ = config.focal_param;
+  }
+}
+
+/* callbackTimerCheckSubscribers() method //{ */
+void ThermalStereo::callbackTimerCheckSubscribers([[maybe_unused]] const ros::TimerEvent &te)
+{
+
+  if (!is_initialized_)
+    return;
+
+  ros::Time time_now = ros::Time::now();
+
+  // Because got_image_, time_last_image_, got_camera_info_ and time_last_camera_info_ are accessed
+  // from multiple threads, this mutex is needed to prevent data races.
+  // mutex_counters_ is released in the destructor of lock when lock goes out of scope (see below)
+  std::scoped_lock lock(mutex_left_thermal_counters_, mutex_right_thermal_counters_);
+
+  /* check whether camera image msgs are coming */
+  if (!got_left_thermal_data_)
+  {
+    ROS_WARN_THROTTLE(1.0, "Not received left thermal data since node launch.");
+  }
+  else
+  {
+    if ((time_now - time_last_left_thermal_data_).toSec() > 1.0)
+    {
+      ROS_WARN_THROTTLE(1.0, "Not received left thermal data msg for %f sec.", (time_now - time_last_left_thermal_data_).toSec());
+    }
+  }
+
+  if (!got_right_thermal_data_)
+  {
+    ROS_WARN_THROTTLE(1.0, "Not received rigth thermal data since node launch.");
+  }
+  else
+  {
+    if ((time_now - time_last_right_thermal_data_).toSec() > 1.0)
+    {
+      ROS_WARN_THROTTLE(1.0, "Not received rigth thermal data msg for %f sec.", (time_now - time_last_right_thermal_data_).toSec());
+    }
+  }
+}
+
+std::vector<std::vector<double>> ThermalStereo::getCenterCoords(std::vector<double> *thermal_data)
+{
+  _Float32 arr[1024];
+  _Float32 temperature_matrix[32][32];
+  std::vector<std::vector<int>> logical_matrix;
+  std::vector<std::vector<int>> cluster_matrix;
+
+  double max_temp = std::max_element(thermal_data->begin(), thermal_data->end())[0];
+  int i = 0;
+
+  // set all the remaining numbers
+  for (std::vector<double>::const_iterator it = thermal_data->begin(); it != thermal_data->end(); ++it)
+  {
+    arr[i++] = *it > _start_temperature_ ? *it : 0;
+  }
+
+  for (int i = 0; i < 32; i++)
+  {
+    for (int j = 0; j < 32; j++)
+    {
+      temperature_matrix[i][j] = arr[32 * i + j] < _heatmap_ratio_ * max_temp ? 0 : arr[32 * i + j];
+    }
+  }
+
+  // init new coordnates array for further interaction
+  std::vector<std::vector<int>> coordinates_matrix;
+
+  logical_matrix = toLogicalArray(temperature_matrix);
+  cluster_matrix = toClusterArray(logical_matrix, coordinates_matrix);
+
+  return getMassCenters(temperature_matrix, coordinates_matrix);
+}
 
 bool checkCorrespondence(double centerYLeft, double centerYRight, double centerXLeft, double centerXRight, int &leftIterator, int &rightIterator)
 {
@@ -62,28 +156,24 @@ bool checkCorrespondence(double centerYLeft, double centerYRight, double centerX
   else
     return true;
 }
-std::vector<double> getDistance(std::vector<std::vector<double>> centersVectorRight, std::vector<std::vector<double>> centersVectorLeft)
+
+std::vector<double> ThermalStereo::getDistance(std::vector<std::vector<double>> centers_vector_right, std::vector<std::vector<double>> centers_vector_left)
 {
   std::vector<double> distanceVector;
-  
-  
+  double distorsion = 0;
 
-  int size = std::min(centersVectorLeft.size(), centersVectorRight.size());
   int leftIterator = 0;
   int rightIterator = 0;
 
-  ROS_INFO("Distance function");
-  
-
-  while ((leftIterator < centersVectorLeft.size()) && (rightIterator < centersVectorRight.size()))
-  { 
+  while ((leftIterator < centers_vector_left.size()) && (rightIterator < centers_vector_right.size()))
+  {
     ROS_INFO("Stucked");
-    
-    double centerYLeft = centersVectorLeft[leftIterator][0];
-    double centerYRight = centersVectorRight[rightIterator][0];
 
-    double centerXLeft = centersVectorLeft[leftIterator][1];
-    double centerXRight = centersVectorRight[rightIterator][1];
+    double centerYLeft = centers_vector_left[leftIterator][0];
+    double centerYRight = centers_vector_right[rightIterator][0];
+
+    double centerXLeft = centers_vector_left[leftIterator][1];
+    double centerXRight = centers_vector_right[rightIterator][1];
 
     if (checkCorrespondence(centerYLeft, centerYRight, centerXLeft, centerXRight, leftIterator, rightIterator))
     {
@@ -97,11 +187,9 @@ std::vector<double> getDistance(std::vector<std::vector<double>> centersVectorRi
       }
       else
       {
-        d = abs(centerXLeft - centerXRight);
-        distanceVector.push_back((F * B) / d);
+        distorsion = abs(centerXLeft - centerXRight);
+        distanceVector.push_back((_focal_param_ * _baseline_) / distorsion);
       }
-
-      
 
       leftIterator++;
       rightIterator++;
@@ -111,7 +199,7 @@ std::vector<double> getDistance(std::vector<std::vector<double>> centersVectorRi
   return distanceVector;
 }
 
-std::vector<std::vector<int>> toLogicalArray(_Float32 temp_matrix[][32])
+std::vector<std::vector<int>> ThermalStereo::toLogicalArray(_Float32 temp_matrix[][32])
 {
   std::vector<std::vector<int>> logical_vector = std::vector(32, std::vector<int>(32, 0));
   for (int i = 0; i < 32; i++)
@@ -126,7 +214,7 @@ std::vector<std::vector<int>> toLogicalArray(_Float32 temp_matrix[][32])
 }
 
 // Xmax Ymax Xmin Ymin
-std::vector<std::vector<int>> toClusterArray(std::vector<std::vector<int>> logical_vector, std::vector<std::vector<int>> &coordinates_map)
+std::vector<std::vector<int>> ThermalStereo::toClusterArray(std::vector<std::vector<int>> logical_vector, std::vector<std::vector<int>> &coordinates_map)
 {
   int clusternum = 1;
   int Xmin;
@@ -156,12 +244,13 @@ std::vector<std::vector<int>> toClusterArray(std::vector<std::vector<int>> logic
 
         int clusterfind = std::max({left, right, down, up});
 
-        // ROS_INFO("clusterfind %d", clusterfind);
+        //ROS_INFO("clusterfind %d", clusterfind);
 
         if (clusterfind > 0)
         {
 
           logical_vector[i][j] = clusterfind;
+          //ROS_INFO("SEGMENTATION ALERT: %d", coordinates_map.size());
           Xmax = std::max(coordinates_map[clusterfind - 1][0], i);
           Ymax = std::max(coordinates_map[clusterfind - 1][1], j);
           Xmin = std::min(coordinates_map[clusterfind - 1][2], i);
@@ -196,7 +285,7 @@ bool compareCoordinates(std::vector<int> v1, std::vector<int> v2)
     return false;
 }
 
-std::vector<std::vector<double>> getMassCenters(_Float32 temperature_matrix[32][32], std::vector<std::vector<int>> coordinates_vector)
+std::vector<std::vector<double>> ThermalStereo::getMassCenters(_Float32 temperature_matrix[32][32], std::vector<std::vector<int>> coordinates_vector)
 {
 
   std::vector<std::vector<double>> output;
@@ -236,137 +325,118 @@ std::vector<std::vector<double>> getMassCenters(_Float32 temperature_matrix[32][
   return output;
 }
 
-//Callbacks
-void tempCallbackRight(const std_msgs::Float64MultiArray::ConstPtr &array)
+void ThermalStereo::main_loop([[maybe_unused]] const ros::TimerEvent &te)
 {
-
-  int i = 0;
-  int j = 0;
+  //ROS_INFO("Main_Loop: Start");
   sensor_msgs::Image dbg_msg;
-  float max_temp = 0;
 
-  // set all the remaining numbers
-  for (std::vector<double>::const_iterator it = array->data.begin(); it != array->data.end(); ++it)
+  if (got_new_left_thermal_data_ && got_new_right_thermal_data_)
   {
-    Arr[i] = *it > START_TEMPERATURE ? *it : 0;
-    if (max_temp < *it)
-    {
-      max_temp = *it;
-    }
-    i++;
+    std::scoped_lock lock(mutex_left_thermal_data_, mutex_right_thermal_data_);
+    //ROS_INFO("Main_Loop: If");
+    centers_vector_left_ = getCenterCoords(&left_thermal_data_);
+    //ROS_INFO("Main_Loop: Left");
+    centers_vector_right_ = getCenterCoords(&right_thermal_data_);
+    //ROS_INFO("Main_Loop: Right");
+
+    //            //whatever you'd need that value for (the position is more likely what you're after)
+    //            double centerOfMassValue = Temperature_matrix[(int)centersVector.at(0)][(int)centersVector.at(1)] = 249;
+
+    //            cv::Mat image = cv::Mat(32, 32, CV_32FC1, temperature_matrix);
+    //            std_msgs::Header header_;
+    //            cv_bridge::CvImage img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::TYPE_32FC1, image);
+    //
+    //            img_bridge.toImageMsg(dbg_msg);
+    //
+    //            // Publish to topic
+    //            dbg_pub_true_temp.publish(dbg_msg);
+
+    ROS_INFO("Distance: %f", getDistance(centers_vector_right_, centers_vector_left_)[0]);
+
+    got_new_left_thermal_data_ = false;
+    got_new_left_thermal_data_ = false;
   }
-
-  for (int i = 0; i < 32; i++)
-  {
-    for (int j = 0; j < 32; j++)
-    {
-      Temperature_matrix[i][j] = Arr[32 * i + j] < HEATMAP_RATIO * max_temp ? 0 : Arr[32 * i + j];
-    }
-  }
-
-  // init new coordnates array for further interaction
-  std::vector<std::vector<int>> coordinates_matrix;
-
-  Logical_matrix = toLogicalArray(Temperature_matrix);
-  Cluster_matrix = toClusterArray(Logical_matrix, coordinates_matrix);
-
-  centersVectorRight = getMassCenters(Temperature_matrix, coordinates_matrix);
-
-  for (int i = 0; i < centersVectorRight.size(); i++)
-  {
-    //whatever you'd need that value for (the position is more likely what you're after)
-    double centerOfMassValue = Temperature_matrix[(int)centersVectorRight[i].at(0)][(int)centersVectorRight[i].at(1)] = 249;
-  }
-
-  cv::Mat image = cv::Mat(32, 32, CV_32FC1, Temperature_matrix);
-  std_msgs::Header header_;
-  cv_bridge::CvImage img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::TYPE_32FC1, image);
-
-  img_bridge.toImageMsg(dbg_msg);
-
-  // Publish to topic
-  dbg_pub_true_temp.publish(dbg_msg);
-  return;
+  //ROS_INFO("Main_Loop: End");
 }
 
-void tempCallbackLeft(const std_msgs::Float64MultiArray::ConstPtr &array)
+void ThermalStereo::onInit()
 {
+  got_left_thermal_data_ = false;
+  got_right_thermal_data_ = false;
+  got_new_left_thermal_data_ = false;
+  got_new_right_thermal_data_ = false;
 
-  int i = 0;
-  int j = 0;
-  sensor_msgs::Image dbg_msg;
-  float max_temp = 0;
+  // get nodelet handle
+  ros::NodeHandle nh_ = nodelet::Nodelet::getMTPrivateNodeHandle();
+  // waits for ros to publish clock
+  ros::Time::waitForValid();
 
-  // set all the remaining numbers
-  for (std::vector<double>::const_iterator it = array->data.begin(); it != array->data.end(); ++it)
-  {
-    Arr_2[i] = *it > START_TEMPERATURE ? *it : 0;
-    if (max_temp < *it)
-    {
-      max_temp = *it;
-    }
-    i++;
-  }
+  // | ------------------- load ros parameters ------------------ |
+  /* (mrs_lib implementation checks whether the parameter was loaded or not) */
+  // Load parameters from .yaml files
+  mrs_lib::ParamLoader param_loader(nh_, "ThermalStereo");
+  //loading from default.yaml
+  param_loader.load_param("rate/check_subscriber", _rate_timer_check_subscribers_);
+  //loading from RUN_TYPE.yaml
+  param_loader.load_param("camera/thermal/heatmap_ratio", _heatmap_ratio_);
+  assert(_heatmap_ratio_ > 0);
+  param_loader.load_param("camera/thermal/start_temperature", _start_temperature_);
+  assert(_start_temperature_ > 0 && _start_temperature_ < 1000);
+  param_loader.load_param("camera/thermal/baseline", _baseline_);
+  assert(_baseline_ > 0 && _baseline_ < 10);
+  param_loader.load_param("camera/thermal/focal_param", _focal_param_);
+  assert(_focal_param_ > 0 && _focal_param_ < 100);
+  param_loader.load_param("camera/thermal/init_dist", _init_dist_);
+  assert(_init_dist_ >= 0);
+  param_loader.load_param("camera/thermal/frequency", _loop_rate_);
+  assert(_loop_rate_ > 0);
 
-  for (int i = 0; i < 32; i++)
-  {
-    for (int j = 0; j < 32; j++)
-    {
-      Temperature_matrix_2[i][j] = Arr_2[32 * i + j] < HEATMAP_RATIO * max_temp ? 0 : Arr_2[32 * i + j];
-    }
-  }
-
-  // init new coordnates array for further interaction
-  std::vector<std::vector<int>> coordinates_matrix;
-
-  Logical_matrix = toLogicalArray(Temperature_matrix_2);
-  Cluster_matrix = toClusterArray(Logical_matrix, coordinates_matrix);
-
-  centersVectorLeft = getMassCenters(Temperature_matrix_2, coordinates_matrix);
-
-  for (int i = 0; i < centersVectorLeft.size(); i++)
-  {
-    //whatever you'd need that value for (the position is more likely what you're after)
-    double centerOfMassValue = Temperature_matrix_2[(int)centersVectorLeft[i].at(0)][(int)centersVectorLeft[i].at(1)] = 249;
-  }
-
-  cv::Mat image = cv::Mat(32, 32, CV_32FC1, Temperature_matrix_2);
-  std_msgs::Header header_;
-  cv_bridge::CvImage img_bridge = cv_bridge::CvImage(header_, sensor_msgs::image_encodings::TYPE_32FC1, image);
-
-  img_bridge.toImageMsg(dbg_msg);
-
-  // Publish to topic
-  dbg_pub_true_temp_left.publish(dbg_msg);
-
-  printf("\n");
-  std::vector<double> distances = getDistance(centersVectorRight, centersVectorLeft);
-  for (int i = 0; i < distances.size(); i++)
-  {
-    ROS_INFO("Distance %d: %f", i, distances[i]);
-  }
-  
-  printf("\n");
-  return; 
-}
-
-int main(int argc, char **argv)
-{
-  ros::init(argc, argv, "image_listener");
-  ros::NodeHandle nh;
-
-  image_transport::ImageTransport it(nh);
+  //    /* initialize the image transport, needs node handle */
+  //    image_transport::ImageTransport it(nh_);
 
   // Subscribers for temperature array
-
-  ros::Subscriber sub_left = nh.subscribe("/uav1/thermal/middle/raw_temp_array", 1, tempCallbackRight);   // Left camera
-  ros::Subscriber sub_right = nh.subscribe("/uav1/thermal/bottom/raw_temp_array", 1, tempCallbackLeft); // Right camera
+  thermal_right_subscriber_ = nh_.subscribe("right_termal", 1, &ThermalStereo::tempCallbackRight, this); // Right camera
+  thermal_left_subscriber_ = nh_.subscribe("left_termal", 1, &ThermalStereo::tempCallbackLeft, this);    // Left camera
 
   // Publishers for temperature arrays (to CV Image)
-  dbg_pub_true_temp = nh.advertise<sensor_msgs::Image>("right_debug_temp", 10);
-  dbg_pub_true_temp_left = nh.advertise<sensor_msgs::Image>("left_debug_temp", 10);
+  dbg_left_true_temp_pub_ = nh_.advertise<sensor_msgs::Image>("debug_thermal_left", 10);
+  dbg_right_true_temp_pub_ = nh_.advertise<sensor_msgs::Image>("debug_thermal_right", 10);
 
-  ROS_INFO("START");
+  //        image_color_subscriber_ = nh_.subscribe("rgb_image", 10, &BallDetection::imageColorCallback, this);
+  //        image_depth_subscriber_ = nh_.subscribe("dm_image", 10, &BallDetection::imageDepthCallback, this);
+  //camera_info_subscriber_ = nh_.subscribe("rgb_camera_info", 1, &BallDetection::callbackCameraInfo, this, ros::TransportHints().tcpNoDelay());
 
-  ros::spin();
+  //        dbg_color_pub_ = it.advertise("debug_color_image", 10);
+  //        dbg_depth_pub_ = it.advertise("debug_depth_image", 10);
+  m_pub_pcl_ = nh_.advertise<sensor_msgs::PointCloud>("detected_objects_pcl", 10);
+
+  //        rgb_camera_model_.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("rgb_camera_info")));
+  //        dm_camera_model_.fromCameraInfo(ros::topic::waitForMessage<sensor_msgs::CameraInfo>(nh_.resolveName("dm_camera_info")));
+
+  // | -------------------- initialize timers ------------------- |
+  m_main_loop_timer_ = nh_.createTimer(ros::Rate(_loop_rate_), &ThermalStereo::main_loop, this);
+  timer_check_subscribers_ = nh_.createTimer(ros::Rate(_rate_timer_check_subscribers_), &ThermalStereo::callbackTimerCheckSubscribers, this);
+
+  //----------initialization of dynamic reconfigure server-------------
+  reconfigure_server_.reset(new ReconfigureServer(mutex_dynamic_reconfidure_, nh_));
+  ReconfigureServer::CallbackType f = boost::bind(&ThermalStereo::callbackDynamicReconfigure, this, _1, _2);
+  reconfigure_server_->setCallback(f);
+
+  // setting default values of dynamicly reconfigured variables
+  {
+    std::scoped_lock lock(mutex_focal_param_);
+    last_drs_config_.focal_param = _focal_param_;
+  }
+
+  reconfigure_server_->updateConfig(last_drs_config_);
+
+  ROS_INFO_THROTTLE(1.0, "[%s]: Node Initialized", m_node_name_.c_str());
+
+  is_initialized_ = true;
 }
+
+} // namespace thermal_stereo
+
+#include <pluginlib/class_list_macros.h>
+
+PLUGINLIB_EXPORT_CLASS(thermal_stereo::ThermalStereo, nodelet::Nodelet)
